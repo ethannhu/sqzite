@@ -1,0 +1,25 @@
+# Zig build outputs
+.zig-cache/
+zig-cache/
+zig-out/
+
+# Compiled artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Local database files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Editor and operating system files
+.DS_Store
+*.swp
+*.swo
