@@ -33,4 +33,5 @@ test {
     _ = @import("storage/node_test.zig");
     _ = @import("storage/table_test.zig");
     _ = @import("sql/lexer_test.zig");
+    _ = @import("sql/parser_test.zig");
 }
