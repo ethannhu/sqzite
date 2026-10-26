@@ -1,4 +1,4 @@
-//! 叶子和内部节点接口约定测试；节点方法实现后再接入测试入口。
+//! 叶子和内部节点接口测试。
 const std = @import("std");
 const btree = @import("btree.zig");
 const pager = @import("pager.zig");
@@ -43,6 +43,15 @@ test "叶子节点拒绝读取槽位范围之外的索引" {
     try std.testing.expectError(error.CellOutOfBounds, leaf.readCell(0));
 }
 
+test "叶子节点拒绝跳过槽位写入" {
+    var page = testPage(7);
+    var leaf = btree.LeafNode.init(&page, 0, 0);
+    const cell = btree.LeafCell{ .key = 1, .value_offset = 100, .value_length = 1 };
+
+    try std.testing.expectError(error.CellOutOfBounds, leaf.writeCell(1, cell));
+    try std.testing.expectEqual(@as(u16, 0), readU16(&page.data, btree.header_layout.cell_count_offset));
+}
+
 test "初始化内部节点会写入头部和第一个子页" {
     var page = testPage(8);
     @memset(&page.data, 0xaa);
@@ -80,6 +89,15 @@ test "内部节点拒绝读取槽位范围之外的索引" {
     var internal = btree.InternalNode.init(&page, 0, 14);
 
     try std.testing.expectError(error.CellOutOfBounds, internal.readCell(0));
+}
+
+test "内部节点拒绝跳过槽位写入" {
+    var page = testPage(15);
+    var internal = btree.InternalNode.init(&page, 0, 16);
+    const cell = btree.InternalCell{ .separator_key = 1, .child_page_id = 17 };
+
+    try std.testing.expectError(error.CellOutOfBounds, internal.writeCell(1, cell));
+    try std.testing.expectEqual(@as(u16, 0), readU16(&page.data, btree.header_layout.cell_count_offset));
 }
 
 fn testPage(id: u32) pager.Page {

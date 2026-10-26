@@ -67,11 +67,83 @@ const LeafRecord = struct {
 /// 叶子节点恰好由一个 Pager 页面承载。
 pub const LeafNode = struct {
     page: *pager.Page,
+
+    /// 清空页面并初始化叶子节点头部。
+    pub fn init(page: *pager.Page, parent_page_id: u32, next_leaf_page_id: u32) LeafNode {
+        @memset(&page.data, 0);
+        page.data[header_layout.node_type_offset] = @intFromEnum(NodeType.leaf);
+        writeU16(&page.data, header_layout.cell_count_offset, 0);
+        writeU32(&page.data, header_layout.parent_page_id_offset, parent_page_id);
+        writeU32(&page.data, leaf_layout.next_leaf_page_id_offset, next_leaf_page_id);
+        page.dirty = true;
+        return .{ .page = page };
+    }
+
+    /// 读取叶子槽位；索引必须小于已写入的槽位数量。
+    pub fn readCell(self: *const LeafNode, index: usize) error{CellOutOfBounds}!LeafCell {
+        const cell_count = readU16(&self.page.data, header_layout.cell_count_offset);
+        if (cell_count > leaf_layout.max_cells or index >= cell_count) return error.CellOutOfBounds;
+        const cell_offset = leaf_layout.header_size + index * leaf_layout.cell_size;
+        return .{
+            .key = readU64(&self.page.data, cell_offset + leaf_cell_layout.key_offset),
+            .value_offset = readU16(&self.page.data, cell_offset + leaf_cell_layout.value_offset_offset),
+            .value_length = readU16(&self.page.data, cell_offset + leaf_cell_layout.value_length_offset),
+        };
+    }
+
+    /// 覆写现有槽位，或追加到槽位末尾；不允许产生空洞。
+    pub fn writeCell(self: *LeafNode, index: usize, cell: LeafCell) error{CellOutOfBounds}!void {
+        const cell_count = readU16(&self.page.data, header_layout.cell_count_offset);
+        if (cell_count > leaf_layout.max_cells or index > cell_count or index >= leaf_layout.max_cells) {
+            return error.CellOutOfBounds;
+        }
+        const cell_offset = leaf_layout.header_size + index * leaf_layout.cell_size;
+        writeU64(&self.page.data, cell_offset + leaf_cell_layout.key_offset, cell.key);
+        writeU16(&self.page.data, cell_offset + leaf_cell_layout.value_offset_offset, cell.value_offset);
+        writeU16(&self.page.data, cell_offset + leaf_cell_layout.value_length_offset, cell.value_length);
+        if (index == cell_count) writeU16(&self.page.data, header_layout.cell_count_offset, cell_count + 1);
+        self.page.dirty = true;
+    }
 };
 
 /// 内部节点恰好由一个 Pager 页面承载。
 pub const InternalNode = struct {
     page: *pager.Page,
+
+    /// 清空页面并初始化内部节点头部及第一个子页。
+    pub fn init(page: *pager.Page, parent_page_id: u32, first_child_page_id: u32) InternalNode {
+        @memset(&page.data, 0);
+        page.data[header_layout.node_type_offset] = @intFromEnum(NodeType.internal);
+        writeU16(&page.data, header_layout.cell_count_offset, 0);
+        writeU32(&page.data, header_layout.parent_page_id_offset, parent_page_id);
+        writeU32(&page.data, internal_layout.first_child_page_id_offset, first_child_page_id);
+        page.dirty = true;
+        return .{ .page = page };
+    }
+
+    /// 读取内部槽位；索引必须小于已写入的槽位数量。
+    pub fn readCell(self: *const InternalNode, index: usize) error{CellOutOfBounds}!InternalCell {
+        const cell_count = readU16(&self.page.data, header_layout.cell_count_offset);
+        if (cell_count > internal_layout.max_cells or index >= cell_count) return error.CellOutOfBounds;
+        const cell_offset = internal_layout.header_size + index * internal_layout.cell_size;
+        return .{
+            .separator_key = readU64(&self.page.data, cell_offset + internal_cell_layout.separator_key_offset),
+            .child_page_id = readU32(&self.page.data, cell_offset + internal_cell_layout.child_page_id_offset),
+        };
+    }
+
+    /// 覆写现有槽位，或追加到槽位末尾；不允许产生空洞。
+    pub fn writeCell(self: *InternalNode, index: usize, cell: InternalCell) error{CellOutOfBounds}!void {
+        const cell_count = readU16(&self.page.data, header_layout.cell_count_offset);
+        if (cell_count > internal_layout.max_cells or index > cell_count or index >= internal_layout.max_cells) {
+            return error.CellOutOfBounds;
+        }
+        const cell_offset = internal_layout.header_size + index * internal_layout.cell_size;
+        writeU64(&self.page.data, cell_offset + internal_cell_layout.separator_key_offset, cell.separator_key);
+        writeU32(&self.page.data, cell_offset + internal_cell_layout.child_page_id_offset, cell.child_page_id);
+        if (index == cell_count) writeU16(&self.page.data, header_layout.cell_count_offset, cell_count + 1);
+        self.page.dirty = true;
+    }
 };
 
 /// 仅区分节点形态，不包含查找、插入或分裂行为。

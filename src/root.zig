@@ -22,4 +22,5 @@ test "basic add functionality" {
 test {
     _ = @import("storage/pager_test.zig");
     _ = @import("storage/btree_test.zig");
+    _ = @import("storage/node_test.zig");
 }

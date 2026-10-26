@@ -41,13 +41,12 @@ test "查询叶子节点中的键返回对应字节值" {
     };
 
     const page = try pager.getPage(0);
-    putU16(&page.data, btree.header_layout.cell_count_offset, 3);
+    var leaf = btree.LeafNode.init(page, 0, 0);
 
-    // 手动构造键升序排列的叶子页，目标键位于中间槽位。
-    page.data[btree.header_layout.node_type_offset] = @intFromEnum(btree.NodeType.leaf);
-    writeLeafCell(page, 0, 10, 128, "ten");
-    writeLeafCell(page, 1, 42, 140, "hello");
-    writeLeafCell(page, 2, 90, 160, "ninety");
+    // 用节点接口构造键升序排列的叶子页，目标键位于中间槽位。
+    try writeLeafCell(&leaf, 0, 10, 128, "ten");
+    try writeLeafCell(&leaf, 1, 42, 140, "hello");
+    try writeLeafCell(&leaf, 2, 90, 160, "ninety");
 
     const result = try tree.search(42);
     try std.testing.expect(result != null);
@@ -72,26 +71,18 @@ test "查询键分别命中内部节点的左中右子叶" {
     };
 
     const root = try pager.getPage(0);
-    root.data[btree.header_layout.node_type_offset] = @intFromEnum(btree.NodeType.internal);
-    putU16(&root.data, btree.header_layout.cell_count_offset, 2);
-    putU32(&root.data, btree.internal_layout.first_child_page_id_offset, 1);
-
-    const first_separator_cell = btree.internal_layout.header_size;
-    putU64(&root.data, first_separator_cell + btree.internal_cell_layout.separator_key_offset, 30);
-    putU32(&root.data, first_separator_cell + btree.internal_cell_layout.child_page_id_offset, 2);
-
-    const second_separator_cell = first_separator_cell + btree.internal_layout.cell_size;
-    putU64(&root.data, second_separator_cell + btree.internal_cell_layout.separator_key_offset, 60);
-    putU32(&root.data, second_separator_cell + btree.internal_cell_layout.child_page_id_offset, 3);
+    var internal = btree.InternalNode.init(root, 0, 1);
+    try internal.writeCell(0, .{ .separator_key = 30, .child_page_id = 2 });
+    try internal.writeCell(1, .{ .separator_key = 60, .child_page_id = 3 });
 
     const left_page = try pager.getPage(1);
-    writeLeafEntry(left_page, 10, 128, "left");
+    try writeLeafEntry(left_page, 10, 128, "left");
 
     const middle_page = try pager.getPage(2);
-    writeLeafEntry(middle_page, 40, 128, "middle");
+    try writeLeafEntry(middle_page, 40, 128, "middle");
 
     const right_page = try pager.getPage(3);
-    writeLeafEntry(right_page, 70, 128, "right");
+    try writeLeafEntry(right_page, 70, 128, "right");
 
     const left_result = try tree.search(10);
     try std.testing.expect(left_result != null);
@@ -229,19 +220,14 @@ test "叶子子节点已满且父节点有空间时分裂并继续插入" {
     };
 
     const root = try pager.getPage(0);
-    root.data[btree.header_layout.node_type_offset] = @intFromEnum(btree.NodeType.internal);
-    putU16(&root.data, btree.header_layout.cell_count_offset, 1);
-    putU32(&root.data, btree.internal_layout.first_child_page_id_offset, 1);
-    const parent_cell = btree.internal_layout.header_size;
-    putU64(&root.data, parent_cell + btree.internal_cell_layout.separator_key_offset, 1000);
-    putU32(&root.data, parent_cell + btree.internal_cell_layout.child_page_id_offset, 2);
+    var internal = btree.InternalNode.init(root, 0, 1);
+    try internal.writeCell(0, .{ .separator_key = 1000, .child_page_id = 2 });
 
     const full_child = try pager.getPage(1);
-    writeFullLeafWithRange(full_child, btree.leaf_layout.max_cells);
-    putU32(&full_child.data, btree.leaf_layout.next_leaf_page_id_offset, 2);
+    try writeFullLeafWithRange(full_child, btree.leaf_layout.max_cells, 2);
 
     const right_child = try pager.getPage(2);
-    writeLeafEntry(right_child, 1000, 128, "right");
+    try writeLeafEntry(right_child, 1000, 128, "right");
 
     // 0..339 已填满左叶子；500 应进入该子树并触发叶子分裂。
     try tree.insert(500, "inserted");
@@ -278,7 +264,7 @@ test "根叶子已满时分裂并创建新的内部根节点" {
         .root_page_id = 0,
     };
     const old_root = try pager.getPage(0);
-    writeFullLeafWithRange(old_root, btree.leaf_layout.max_cells);
+    try writeFullLeafWithRange(old_root, btree.leaf_layout.max_cells, 0);
 
     try tree.insert(btree.leaf_layout.max_cells, "new");
 
@@ -294,35 +280,30 @@ test "根叶子已满时分裂并创建新的内部根节点" {
     try std.testing.expectEqualSlices(u8, "new", (try tree.search(btree.leaf_layout.max_cells)).?);
 }
 
-fn writeLeafEntry(page: *pager_module.Page, key: u64, value_offset: u16, value: []const u8) void {
-    page.data[btree.header_layout.node_type_offset] = @intFromEnum(btree.NodeType.leaf);
-    putU16(&page.data, btree.header_layout.cell_count_offset, 1);
-    writeLeafCell(page, 0, key, value_offset, value);
+fn writeLeafEntry(page: *pager_module.Page, key: u64, value_offset: u16, value: []const u8) !void {
+    var leaf = btree.LeafNode.init(page, 0, 0);
+    try writeLeafCell(&leaf, 0, key, value_offset, value);
 }
 
-fn writeFullLeafWithRange(page: *pager_module.Page, cell_count: usize) void {
-    page.data[btree.header_layout.node_type_offset] = @intFromEnum(btree.NodeType.leaf);
-    putU16(&page.data, btree.header_layout.cell_count_offset, @intCast(cell_count));
+fn writeFullLeafWithRange(page: *pager_module.Page, cell_count: usize, next_leaf_page_id: u32) !void {
+    var leaf = btree.LeafNode.init(page, 0, next_leaf_page_id);
     for (0..cell_count) |index| {
-        const cell_offset = btree.leaf_layout.header_size + index * btree.leaf_layout.cell_size;
-        putU64(&page.data, cell_offset + btree.leaf_cell_layout.key_offset, index);
-        putU16(&page.data, cell_offset + btree.leaf_cell_layout.value_offset_offset, pager_module.page_size);
-        putU16(&page.data, cell_offset + btree.leaf_cell_layout.value_length_offset, 0);
+        try leaf.writeCell(index, .{
+            .key = @intCast(index),
+            .value_offset = pager_module.page_size,
+            .value_length = 0,
+        });
     }
 }
 
-fn writeLeafCell(page: *pager_module.Page, index: usize, key: u64, value_offset: u16, value: []const u8) void {
-    const cell_offset = btree.leaf_layout.header_size + index * btree.leaf_layout.cell_size;
-    putU64(&page.data, cell_offset + btree.leaf_cell_layout.key_offset, key);
-    putU16(&page.data, cell_offset + btree.leaf_cell_layout.value_offset_offset, value_offset);
-    putU16(&page.data, cell_offset + btree.leaf_cell_layout.value_length_offset, @intCast(value.len));
+fn writeLeafCell(leaf: *btree.LeafNode, index: usize, key: u64, value_offset: u16, value: []const u8) !void {
     const start: usize = value_offset;
-    @memcpy(page.data[start .. start + value.len], value);
-}
-
-fn putU16(data: []u8, offset: usize, value: u16) void {
-    data[offset] = @truncate(value);
-    data[offset + 1] = @truncate(value >> 8);
+    @memcpy(leaf.page.data[start .. start + value.len], value);
+    try leaf.writeCell(index, .{
+        .key = key,
+        .value_offset = value_offset,
+        .value_length = @intCast(value.len),
+    });
 }
 
 fn getU16(data: []const u8, offset: usize) u16 {
@@ -334,16 +315,4 @@ fn readU32(data: []const u8, offset: usize) u32 {
         (@as(u32, data[offset + 1]) << 8) |
         (@as(u32, data[offset + 2]) << 16) |
         (@as(u32, data[offset + 3]) << 24);
-}
-
-fn putU32(data: []u8, offset: usize, value: u32) void {
-    for (0..4) |index| {
-        data[offset + index] = @truncate(value >> @as(u5, @intCast(index * 8)));
-    }
-}
-
-fn putU64(data: []u8, offset: usize, value: u64) void {
-    for (0..8) |index| {
-        data[offset + index] = @truncate(value >> @as(u6, @intCast(index * 8)));
-    }
 }
