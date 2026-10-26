@@ -7,6 +7,12 @@ pub const node = @import("storage/node.zig");
 pub const pager = @import("storage/pager.zig");
 pub const record = @import("storage/record.zig");
 pub const table = @import("storage/table.zig");
+pub const sql_ast = @import("sql/ast.zig");
+pub const lexer = @import("sql/lexer.zig");
+pub const parser = @import("sql/parser.zig");
+pub const binder = @import("sql/binder.zig");
+pub const planner = @import("sql/planner.zig");
+pub const catalog = @import("catalog/catalog.zig");
 
 /// 向指定 writer 输出测试提示。
 pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
@@ -26,4 +32,5 @@ test {
     _ = @import("storage/btree_test.zig");
     _ = @import("storage/node_test.zig");
     _ = @import("storage/table_test.zig");
+    _ = @import("sql/lexer_test.zig");
 }
