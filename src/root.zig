@@ -3,6 +3,7 @@ const std = @import("std");
 const Io = std.Io;
 
 pub const btree = @import("storage/btree.zig");
+pub const node = @import("storage/node.zig");
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
 ///
