@@ -421,11 +421,20 @@ fn nodeCellCount(current: node.Node) RebalanceError!usize {
     return current.cellCount() catch |err| return mapNodeErrorToRebalance(err);
 }
 
-fn nodeMinCellCount(current: node.Node) usize {
-    return switch (current) {
-        .leaf => node.leaf_layout.max_cells / 2,
-        .internal => node.internal_layout.max_cells / 2,
+fn nodeUnderfull(current: node.Node) RebalanceError!bool {
+    const count = try nodeCellCount(current);
+    const occupied = switch (current) {
+        .leaf => |leaf| blk: {
+            var bytes = node.leaf_layout.header_size + count * node.leaf_layout.cell_size;
+            for (0..count) |index| {
+                const cell = leaf.readCell(index) catch |err| return mapNodeErrorToRebalance(err);
+                bytes += cell.value_length;
+            }
+            break :blk bytes;
+        },
+        .internal => node.internal_layout.header_size + count * node.internal_layout.cell_size,
     };
+    return occupied < pager.page_size / 2;
 }
 
 fn rebalanceAt(tree: *BPlusTree, page_id: u32, depth: usize) RebalanceError!void {
@@ -448,8 +457,7 @@ fn rebalanceAt(tree: *BPlusTree, page_id: u32, depth: usize) RebalanceError!void
         return;
     }
 
-    const minimum = nodeMinCellCount(current);
-    if (current_count >= minimum) return;
+    if (!try nodeUnderfull(current)) return;
 
     const parent_page_id = nodeParentPageId(current);
     const parent_page = tree.pager.getPage(parent_page_id) catch return error.Storage;
@@ -484,8 +492,7 @@ fn rebalanceAt(tree: *BPlusTree, page_id: u32, depth: usize) RebalanceError!void
         const left_node = node.Node.open(left_page) catch |err| return mapNodeErrorToRebalance(err);
         const current_page = tree.pager.getPage(page_id) catch return error.Storage;
         const current_node = node.Node.open(current_page) catch |err| return mapNodeErrorToRebalance(err);
-        if (try nodeCellCount(left_node) >= nodeMinCellCount(left_node) and
-            try nodeCellCount(current_node) >= nodeMinCellCount(current_node)) return;
+        if (!try nodeUnderfull(left_node) and !try nodeUnderfull(current_node)) return;
     }
     if (right_sibling) |sibling_id| {
         tree.redistributeSiblings(page_id, sibling_id) catch |err| {
@@ -495,8 +502,7 @@ fn rebalanceAt(tree: *BPlusTree, page_id: u32, depth: usize) RebalanceError!void
         const current_node = node.Node.open(current_page) catch |err| return mapNodeErrorToRebalance(err);
         const right_page = tree.pager.getPage(sibling_id) catch return error.Storage;
         const right_node = node.Node.open(right_page) catch |err| return mapNodeErrorToRebalance(err);
-        if (try nodeCellCount(current_node) >= nodeMinCellCount(current_node) and
-            try nodeCellCount(right_node) >= nodeMinCellCount(right_node)) return;
+        if (!try nodeUnderfull(current_node) and !try nodeUnderfull(right_node)) return;
     }
 
     if (left_sibling) |sibling_id| {

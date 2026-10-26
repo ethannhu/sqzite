@@ -5,6 +5,8 @@ const Io = std.Io;
 pub const btree = @import("storage/btree.zig");
 pub const node = @import("storage/node.zig");
 pub const pager = @import("storage/pager.zig");
+pub const record = @import("storage/record.zig");
+pub const table = @import("storage/table.zig");
 
 /// 向指定 writer 输出测试提示。
 pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
@@ -23,4 +25,5 @@ test {
     _ = @import("storage/pager_test.zig");
     _ = @import("storage/btree_test.zig");
     _ = @import("storage/node_test.zig");
+    _ = @import("storage/table_test.zig");
 }
