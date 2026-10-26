@@ -280,6 +280,78 @@ test "根叶子已满时分裂并创建新的内部根节点" {
     try std.testing.expectEqualSlices(u8, "new", (try tree.search(btree.leaf_layout.max_cells)).?);
 }
 
+test "叶子分裂穿过已满的父节点和根节点向上级联" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var pager = try pager_module.Pager.open(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "db",
+    );
+    defer pager.close() catch {};
+
+    const root_page = try pager.allocatePage();
+    const full_internal_page = try pager.allocatePage();
+    var inner_child_ids: [btree.internal_layout.max_cells + 1]u32 = undefined;
+    for (&inner_child_ids) |*child_id| {
+        const child_page = try pager.allocatePage();
+        child_id.* = child_page.id;
+    }
+
+    var tree = btree.BPlusTree{
+        .pager = &pager,
+        .root_page_id = root_page.id,
+    };
+
+    // 根和其第一个内部子节点均填满，目标叶子位于这两层的最左侧。
+    var root = btree.InternalNode.init(root_page, 0, full_internal_page.id);
+    var full_internal = btree.InternalNode.init(full_internal_page, root_page.id, inner_child_ids[0]);
+
+    for (0..btree.internal_layout.max_cells) |index| {
+        try full_internal.writeCell(index, .{
+            .separator_key = @as(u64, @intCast(index + 1)) * 1000,
+            .child_page_id = inner_child_ids[index + 1],
+        });
+    }
+
+    const first_leaf = try pager.getPage(inner_child_ids[0]);
+    try writeFullLeafWithRange(first_leaf, btree.leaf_layout.max_cells, inner_child_ids[1]);
+    for (1..inner_child_ids.len) |index| {
+        const leaf_page = try pager.getPage(inner_child_ids[index]);
+        try writeLeafEntry(leaf_page, @as(u64, @intCast(index)) * 1000, pager_module.page_size, "");
+    }
+
+    for (0..btree.internal_layout.max_cells) |index| {
+        const sibling_page = try pager.allocatePage();
+        try root.writeCell(index, .{
+            .separator_key = @as(u64, @intCast(index + 1)) * 1_000_000,
+            .child_page_id = sibling_page.id,
+        });
+        try writeLeafEntry(
+            sibling_page,
+            @as(u64, @intCast(index + 1)) * 1_000_000,
+            pager_module.page_size,
+            "",
+        );
+    }
+
+    // 触发目标叶子分裂、满内部节点分裂，随后满根节点也分裂。
+    try tree.insert(500, "inserted");
+
+    try std.testing.expect(tree.root_page_id.? != root_page.id);
+    const new_root = try pager.getPage(tree.root_page_id.?);
+    try std.testing.expectEqual(@as(u16, 1), getU16(&new_root.data, btree.header_layout.cell_count_offset));
+    try std.testing.expectEqualSlices(u8, "inserted", (try tree.search(500)).?);
+    try std.testing.expect((try tree.search(1000)) != null);
+    try std.testing.expect((try tree.search(200_000_000)) != null);
+    const split_right_id = readU32(&first_leaf.data, btree.leaf_layout.next_leaf_page_id_offset);
+    try std.testing.expect(split_right_id != inner_child_ids[1]);
+    const split_right = try pager.getPage(split_right_id);
+    try std.testing.expectEqual(inner_child_ids[1], readU32(&split_right.data, btree.leaf_layout.next_leaf_page_id_offset));
+}
+
 fn writeLeafEntry(page: *pager_module.Page, key: u64, value_offset: u16, value: []const u8) !void {
     var leaf = btree.LeafNode.init(page, 0, 0);
     try writeLeafCell(&leaf, 0, key, value_offset, value);

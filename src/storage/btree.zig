@@ -166,7 +166,7 @@ pub const BPlusTree = struct {
     pager: *pager.Pager,
     root_page_id: ?u32,
 
-    /// 插入键值；叶子页需要空间时分裂，父节点满时返回 NoSpace。
+    /// 插入键值；叶子页或内部页满时分裂，并将分隔键向根递归传播。
     pub fn insert(self: *BPlusTree, key: u64, value: []const u8) InsertError!void {
         if (value.len > pager.page_size - leaf_layout.header_size - leaf_layout.cell_size) {
             return error.NoSpace;
@@ -267,7 +267,7 @@ fn splitLeafAndInsert(
     if (cell_count > leaf_layout.max_cells) return error.CorruptNode;
     if (findLeafCell(&page.data, key, cell_count) != null) return error.DuplicateKey;
 
-    // 先确认原父节点可容纳新增分隔键，避免分裂后才发现父节点已满。
+    // 定位叶子在父节点中的槽位，后续将分隔键递归插入父节点。
     var parent: ?*pager.Page = null;
     var child_index: usize = 0;
     if (parent_page_id) |parent_id| {
@@ -277,7 +277,6 @@ fn splitLeafAndInsert(
         }
         const parent_cells = readU16(&parent_page.data, header_layout.cell_count_offset);
         if (parent_cells > internal_layout.max_cells) return error.CorruptNode;
-        if (parent_cells == internal_layout.max_cells) return error.NoSpace;
         child_index = findChildIndex(&parent_page.data, page.id, parent_cells) orelse return error.CorruptNode;
         parent = parent_page;
     }
@@ -334,7 +333,7 @@ fn splitLeafAndInsert(
     if (parent) |parent_page| {
         try buildLeafPage(page, left_records, &values, parent_page.id, right_page.id);
         try buildLeafPage(right_page, right_records, &values, parent_page.id, old_next_page_id);
-        try insertIntoInternal(parent_page, child_index, right_records[0].key, right_page.id);
+        try insertSeparator(tree, parent_page, child_index, right_records[0].key, right_page.id);
         return;
     }
 
@@ -343,6 +342,128 @@ fn splitLeafAndInsert(
     try buildLeafPage(right_page, right_records, &values, new_root.id, old_next_page_id);
     initializeInternalRoot(new_root, page.id, right_records[0].key, right_page.id);
     tree.root_page_id = new_root.id;
+}
+
+/// 将子节点分裂产生的分隔键插入父节点；满时拆分内部节点并向上递归。
+fn insertSeparator(
+    tree: *BPlusTree,
+    parent_page: *pager.Page,
+    child_index: usize,
+    separator: u64,
+    right_child_page_id: u32,
+) InsertError!void {
+    const cell_count = readU16(&parent_page.data, header_layout.cell_count_offset);
+    if (cell_count > internal_layout.max_cells or child_index > cell_count) return error.CorruptNode;
+
+    if (cell_count < internal_layout.max_cells) {
+        try insertIntoInternal(parent_page, child_index, separator, right_child_page_id);
+        const right_child = tree.pager.getPage(right_child_page_id) catch return error.Storage;
+        setParentPageId(right_child, parent_page.id);
+        return;
+    }
+
+    const total_cells = @as(usize, cell_count) + 1;
+    var separators: [internal_layout.max_cells + 1]u64 = undefined;
+    var children: [internal_layout.max_cells + 2]u32 = undefined;
+
+    children[0] = readU32(&parent_page.data, internal_layout.first_child_page_id_offset);
+    for (0..cell_count) |index| {
+        const cell_offset = internal_layout.header_size + index * internal_layout.cell_size;
+        separators[index] = readU64(&parent_page.data, cell_offset + internal_cell_layout.separator_key_offset);
+        children[index + 1] = readU32(&parent_page.data, cell_offset + internal_cell_layout.child_page_id_offset);
+    }
+
+    var merged_separators: [internal_layout.max_cells + 1]u64 = undefined;
+    var merged_children: [internal_layout.max_cells + 2]u32 = undefined;
+    for (0..total_cells) |index| {
+        if (index < child_index) {
+            merged_separators[index] = separators[index];
+        } else if (index == child_index) {
+            merged_separators[index] = separator;
+        } else {
+            merged_separators[index] = separators[index - 1];
+        }
+    }
+    for (0..total_cells + 1) |index| {
+        if (index <= child_index) {
+            merged_children[index] = children[index];
+        } else if (index == child_index + 1) {
+            merged_children[index] = right_child_page_id;
+        } else {
+            merged_children[index] = children[index - 1];
+        }
+    }
+
+    const split_index = total_cells / 2;
+    const promoted_separator = merged_separators[split_index];
+    const parent_page_id = readU32(&parent_page.data, header_layout.parent_page_id_offset);
+    const is_root = tree.root_page_id != null and tree.root_page_id.? == parent_page.id;
+    const right_page = tree.pager.allocatePage() catch return error.Storage;
+
+    try buildInternalPage(
+        parent_page,
+        parent_page_id,
+        merged_children[0],
+        merged_separators[0..split_index],
+        merged_children[0 .. split_index + 1],
+    );
+    try buildInternalPage(
+        right_page,
+        parent_page_id,
+        merged_children[split_index + 1],
+        merged_separators[split_index + 1 .. total_cells],
+        merged_children[split_index + 1 .. total_cells + 1],
+    );
+
+    for (merged_children[0 .. split_index + 1]) |child_id| {
+        const child = tree.pager.getPage(child_id) catch return error.Storage;
+        setParentPageId(child, parent_page.id);
+    }
+    for (merged_children[split_index + 1 .. total_cells + 1]) |child_id| {
+        const child = tree.pager.getPage(child_id) catch return error.Storage;
+        setParentPageId(child, right_page.id);
+    }
+
+    if (is_root) {
+        const new_root = tree.pager.allocatePage() catch return error.Storage;
+        initializeInternalRoot(new_root, parent_page.id, promoted_separator, right_page.id);
+        setParentPageId(parent_page, new_root.id);
+        setParentPageId(right_page, new_root.id);
+        tree.root_page_id = new_root.id;
+        return;
+    }
+
+    const grandparent = tree.pager.getPage(parent_page_id) catch return error.Storage;
+    if (grandparent.data[header_layout.node_type_offset] != @intFromEnum(NodeType.internal)) {
+        return error.InvalidNodeType;
+    }
+    const grandparent_count = readU16(&grandparent.data, header_layout.cell_count_offset);
+    if (grandparent_count > internal_layout.max_cells) return error.CorruptNode;
+    const parent_index = findChildIndex(&grandparent.data, parent_page.id, grandparent_count) orelse return error.CorruptNode;
+    try insertSeparator(tree, grandparent, parent_index, promoted_separator, right_page.id);
+}
+
+/// 按槽位序列构建内部节点，并更新公共头部。
+fn buildInternalPage(
+    page: *pager.Page,
+    parent_page_id: u32,
+    first_child_page_id: u32,
+    separators: []const u64,
+    children: []const u32,
+) InsertError!void {
+    if (separators.len > internal_layout.max_cells or children.len != separators.len + 1) return error.CorruptNode;
+    _ = InternalNode.init(page, parent_page_id, first_child_page_id);
+    var node = InternalNode{ .page = page };
+    for (separators, 0..) |key, index| {
+        node.writeCell(index, .{ .separator_key = key, .child_page_id = children[index + 1] }) catch {
+            return error.CorruptNode;
+        };
+    }
+}
+
+fn setParentPageId(page: *pager.Page, parent_page_id: u32) void {
+    writeU32(&page.data, header_layout.parent_page_id_offset, parent_page_id);
+    page.dirty = true;
 }
 
 fn leafRecordsFit(records: []const LeafRecord) bool {
