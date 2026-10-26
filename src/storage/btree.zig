@@ -6,8 +6,26 @@ const LeafRecord = node.LeafRecord;
 /// 搜索过程中可能遇到的节点或存储错误。
 pub const SearchError = error{ CorruptNode, InvalidNodeType, Storage };
 
+/// 同父节点下兄弟页的相对方向。
+pub const SiblingDirection = enum {
+    previous,
+    next,
+};
+
 /// 插入时可能遇到的结构、容量或存储错误。
 pub const InsertError = error{ CorruptNode, DuplicateKey, InvalidNodeType, NoSpace, Storage };
+
+/// 删除时可能遇到的结构、容量或存储错误。
+pub const DeleteError = error{ CorruptNode, InvalidNodeType, NoSpace, Storage };
+
+/// 合并相邻节点时可能遇到的结构、容量或存储错误。
+pub const MergeError = error{ CorruptNode, InvalidNodeType, NotSiblings, NotAdjacent, NoSpace, Storage };
+
+/// 兄弟节点重分配时可能遇到的结构、容量或存储错误。
+pub const RedistributeError = error{ CorruptNode, InvalidNodeType, NotSiblings, NotAdjacent, NoSpace, Storage };
+
+/// 节点重平衡时可能遇到的结构、容量或存储错误。
+pub const RebalanceError = error{ CorruptNode, InvalidNodeType, NotSiblings, NotAdjacent, NoSpace, Storage };
 
 /// 查询结果是叶子页中的借用数据，生命周期受 Pager 页面缓存管理。
 pub const SearchResult = ?[]const u8;
@@ -23,6 +41,63 @@ fn mapInsertNodeError(err: node.NodeError) InsertError {
     return switch (err) {
         error.InvalidNodeType => error.InvalidNodeType,
         error.DuplicateKey => error.DuplicateKey,
+        error.NoSpace => error.NoSpace,
+        else => error.CorruptNode,
+    };
+}
+
+fn mapMergeNodeError(err: node.NodeError) MergeError {
+    return switch (err) {
+        error.InvalidNodeType => error.InvalidNodeType,
+        error.NoSpace => error.NoSpace,
+        else => error.CorruptNode,
+    };
+}
+
+fn mapRedistributeNodeError(err: node.NodeError) RedistributeError {
+    return switch (err) {
+        error.InvalidNodeType => error.InvalidNodeType,
+        error.NoSpace => error.NoSpace,
+        else => error.CorruptNode,
+    };
+}
+
+fn mapMergeErrorToRedistribute(err: MergeError) RedistributeError {
+    return switch (err) {
+        error.CorruptNode => error.CorruptNode,
+        error.InvalidNodeType => error.InvalidNodeType,
+        error.NotSiblings => error.NotSiblings,
+        error.NotAdjacent => error.NotAdjacent,
+        error.NoSpace => error.NoSpace,
+        error.Storage => error.Storage,
+    };
+}
+
+fn mapRedistributeErrorToRebalance(err: RedistributeError) RebalanceError {
+    return switch (err) {
+        error.CorruptNode => error.CorruptNode,
+        error.InvalidNodeType => error.InvalidNodeType,
+        error.NotSiblings => error.NotSiblings,
+        error.NotAdjacent => error.NotAdjacent,
+        error.NoSpace => error.NoSpace,
+        error.Storage => error.Storage,
+    };
+}
+
+fn mapMergeErrorToRebalance(err: MergeError) RebalanceError {
+    return switch (err) {
+        error.CorruptNode => error.CorruptNode,
+        error.InvalidNodeType => error.InvalidNodeType,
+        error.NotSiblings => error.NotSiblings,
+        error.NotAdjacent => error.NotAdjacent,
+        error.NoSpace => error.NoSpace,
+        error.Storage => error.Storage,
+    };
+}
+
+fn mapNodeErrorToRebalance(err: node.NodeError) RebalanceError {
+    return switch (err) {
+        error.InvalidNodeType => error.InvalidNodeType,
         error.NoSpace => error.NoSpace,
         else => error.CorruptNode,
     };
@@ -94,7 +169,607 @@ pub const BPlusTree = struct {
 
         return error.CorruptNode;
     }
+
+    /// 删除指定键；键不存在时返回 false，成功删除时调整节点占用和分隔键。
+    pub fn delete(self: *BPlusTree, key: u64) DeleteError!bool {
+        const root_page_id = self.root_page_id orelse return false;
+        var page_id = root_page_id;
+
+        for (0..128) |_| {
+            const page = self.pager.getPage(page_id) catch return error.Storage;
+            const current = node.Node.open(page) catch |err| return mapDeleteNodeError(err);
+            switch (current) {
+                .leaf => |leaf| {
+                    const found = (leaf.findKey(key) catch |err| return mapDeleteNodeError(err)) orelse return false;
+                    try deleteLeafRecord(leaf, found);
+                    if (page_id == root_page_id) {
+                        const remaining = leaf.cellCount() catch |err| return mapDeleteNodeError(err);
+                        if (remaining == 0) {
+                            node.invalidatePage(page);
+                            self.root_page_id = null;
+                        }
+                        return true;
+                    }
+
+                    self.rebalanceNode(page_id) catch |err| return mapDeleteRebalanceError(err);
+                    if (self.root_page_id) |new_root| {
+                        _ = try refreshSeparators(self, new_root, 0);
+                    }
+                    return true;
+                },
+                .internal => |internal| {
+                    page_id = internal.childPageForKey(key) catch |err| return mapDeleteNodeError(err);
+                },
+            }
+        }
+
+        return error.CorruptNode;
+    }
+
+    /// 返回当前节点在同一父节点下相邻的兄弟页号；根节点和边界位置返回 null。
+    pub fn siblingPageId(self: *BPlusTree, page_id: u32, direction: SiblingDirection) SearchError!?u32 {
+        const root_page_id = self.root_page_id orelse return null;
+        if (page_id == root_page_id) return null;
+
+        const page = self.pager.getPage(page_id) catch return error.Storage;
+        const current = node.Node.open(page) catch |err| return mapSearchNodeError(err);
+        const parent_page_id = switch (current) {
+            .leaf => |leaf| leaf.parentPageId(),
+            .internal => |internal| internal.parentPageId(),
+        };
+
+        const parent_page = self.pager.getPage(parent_page_id) catch return error.Storage;
+        const parent_node = node.Node.open(parent_page) catch |err| return mapSearchNodeError(err);
+        const parent = switch (parent_node) {
+            .internal => |internal| internal,
+            .leaf => return error.InvalidNodeType,
+        };
+        const child_index = (parent.childIndex(page_id) catch |err| return mapSearchNodeError(err)) orelse {
+            return error.CorruptNode;
+        };
+        const child_count = parent.cellCount() catch |err| return mapSearchNodeError(err);
+
+        const adjacent_index = switch (direction) {
+            .previous => if (child_index == 0) return null else child_index - 1,
+            .next => if (child_index == child_count) return null else child_index + 1,
+        };
+        return parent.childPageAt(adjacent_index) catch |err| return mapSearchNodeError(err);
+    }
+
+    /// 将同一父节点下相邻的两个兄弟合并进左页，并移除父节点中的分隔键。
+    pub fn mergeSiblings(self: *BPlusTree, left_page_id: u32, right_page_id: u32) MergeError!void {
+        if (left_page_id == right_page_id) return error.NotAdjacent;
+        const root_page_id = self.root_page_id orelse return error.CorruptNode;
+        if (left_page_id == root_page_id or right_page_id == root_page_id) return error.NotSiblings;
+
+        const left_page = self.pager.getPage(left_page_id) catch return error.Storage;
+        const right_page = self.pager.getPage(right_page_id) catch return error.Storage;
+        const left_node = node.Node.open(left_page) catch |err| return mapMergeNodeError(err);
+        const right_node = node.Node.open(right_page) catch |err| return mapMergeNodeError(err);
+        const left_parent_id = nodeParentPageId(left_node);
+        if (left_parent_id != nodeParentPageId(right_node)) return error.NotSiblings;
+
+        const parent_page = self.pager.getPage(left_parent_id) catch return error.Storage;
+        const parent_node = node.Node.open(parent_page) catch |err| return mapMergeNodeError(err);
+        var parent = switch (parent_node) {
+            .internal => |internal| internal,
+            .leaf => return error.InvalidNodeType,
+        };
+        const left_index = (parent.childIndex(left_page_id) catch |err| return mapMergeNodeError(err)) orelse {
+            return error.CorruptNode;
+        };
+        const right_index = (parent.childIndex(right_page_id) catch |err| return mapMergeNodeError(err)) orelse {
+            return error.CorruptNode;
+        };
+        if (right_index != left_index + 1) return error.NotAdjacent;
+        const parent_separator = (parent.readCell(left_index) catch |err| return mapMergeNodeError(err)).separator_key;
+
+        switch (left_node) {
+            .leaf => |left| switch (right_node) {
+                .leaf => |right| try mergeLeafPages(left, right, left_parent_id),
+                .internal => return error.InvalidNodeType,
+            },
+            .internal => |left| switch (right_node) {
+                .leaf => return error.InvalidNodeType,
+                .internal => |right| try mergeInternalPages(self, left, right, parent_separator, left_parent_id),
+            },
+        }
+
+        _ = parent.deleteCell(left_index) catch |err| return mapMergeNodeError(err);
+        const remaining_parent_cells = parent.cellCount() catch |err| return mapMergeNodeError(err);
+        if (self.root_page_id.? == parent_page.id and remaining_parent_cells == 0) {
+            var merged = node.Node.open(left_page) catch |err| return mapMergeNodeError(err);
+            merged.setParentPageId(0);
+            self.root_page_id = left_page_id;
+            node.invalidatePage(parent_page);
+        }
+    }
+
+    /// 在相邻兄弟之间平衡 Cell，并更新父节点分隔键。
+    pub fn redistributeSiblings(self: *BPlusTree, left_page_id: u32, right_page_id: u32) RedistributeError!void {
+        if (left_page_id == right_page_id) return error.NotAdjacent;
+        const root_page_id = self.root_page_id orelse return error.CorruptNode;
+        if (left_page_id == root_page_id or right_page_id == root_page_id) return error.NotSiblings;
+
+        const left_page = self.pager.getPage(left_page_id) catch return error.Storage;
+        const right_page = self.pager.getPage(right_page_id) catch return error.Storage;
+        const left_node = node.Node.open(left_page) catch |err| return mapRedistributeNodeError(err);
+        const right_node = node.Node.open(right_page) catch |err| return mapRedistributeNodeError(err);
+        const parent_page_id = nodeParentPageId(left_node);
+        if (parent_page_id != nodeParentPageId(right_node)) return error.NotSiblings;
+
+        const parent_page = self.pager.getPage(parent_page_id) catch return error.Storage;
+        const parent_node = node.Node.open(parent_page) catch |err| return mapRedistributeNodeError(err);
+        const parent = switch (parent_node) {
+            .internal => |internal| internal,
+            .leaf => return error.InvalidNodeType,
+        };
+        const left_index = (parent.childIndex(left_page_id) catch |err| return mapRedistributeNodeError(err)) orelse {
+            return error.CorruptNode;
+        };
+        const right_index = (parent.childIndex(right_page_id) catch |err| return mapRedistributeNodeError(err)) orelse {
+            return error.CorruptNode;
+        };
+        if (right_index != left_index + 1) return error.NotAdjacent;
+
+        switch (left_node) {
+            .leaf => |left| switch (right_node) {
+                .leaf => |right| try redistributeLeafPages(left, right, parent, left_index),
+                .internal => return error.InvalidNodeType,
+            },
+            .internal => |left| switch (right_node) {
+                .leaf => return error.InvalidNodeType,
+                .internal => |right| try redistributeInternalPages(self, left, right, parent, left_index),
+            },
+        }
+    }
+
+    /// 从指定节点开始，先重分配兄弟 Cell；无法达到最小占用时合并并向父节点递归。
+    pub fn rebalanceNode(self: *BPlusTree, page_id: u32) RebalanceError!void {
+        try rebalanceAt(self, page_id, 0);
+    }
 };
+
+fn mapDeleteNodeError(err: node.NodeError) DeleteError {
+    return switch (err) {
+        error.InvalidNodeType => error.InvalidNodeType,
+        error.NoSpace => error.NoSpace,
+        else => error.CorruptNode,
+    };
+}
+
+fn mapDeleteRebalanceError(err: RebalanceError) DeleteError {
+    return switch (err) {
+        error.CorruptNode => error.CorruptNode,
+        error.InvalidNodeType => error.InvalidNodeType,
+        error.NoSpace => error.NoSpace,
+        error.NotSiblings, error.NotAdjacent => error.CorruptNode,
+        error.Storage => error.Storage,
+    };
+}
+
+fn deleteLeafRecord(leaf: node.LeafNode, deleted_index: usize) DeleteError!void {
+    const count = leaf.cellCount() catch |err| return mapDeleteNodeError(err);
+    if (deleted_index >= count) return error.CorruptNode;
+
+    var records: [node.leaf_layout.max_cells]LeafRecord = undefined;
+    var values: [pager.page_size]u8 = undefined;
+    var record_count: usize = 0;
+    var values_len: usize = 0;
+    for (0..count) |index| {
+        if (index == deleted_index) continue;
+        const cell = leaf.readCell(index) catch |err| return mapDeleteNodeError(err);
+        const value = leaf.readValue(index) catch |err| return mapDeleteNodeError(err);
+        if (value.len > values.len - values_len) return error.CorruptNode;
+        @memcpy(values[values_len .. values_len + value.len], value);
+        records[record_count] = .{
+            .key = cell.key,
+            .value_offset = values_len,
+            .value_length = value.len,
+        };
+        record_count += 1;
+        values_len += value.len;
+    }
+
+    node.rebuildLeafPage(
+        leaf.page,
+        records[0..record_count],
+        values[0..values_len],
+        leaf.parentPageId(),
+        leaf.nextLeafPageId(),
+    ) catch |err| return mapDeleteNodeError(err);
+}
+
+fn refreshSeparators(tree: *BPlusTree, page_id: u32, depth: usize) DeleteError!u64 {
+    if (depth >= 128) return error.CorruptNode;
+    const page = tree.pager.getPage(page_id) catch return error.Storage;
+    const current = node.Node.open(page) catch |err| return mapDeleteNodeError(err);
+    switch (current) {
+        .leaf => |leaf| {
+            const count = leaf.cellCount() catch |err| return mapDeleteNodeError(err);
+            if (count == 0) return error.CorruptNode;
+            return (leaf.readCell(0) catch |err| return mapDeleteNodeError(err)).key;
+        },
+        .internal => |internal_value| {
+            var internal = internal_value;
+            const count = internal.cellCount() catch |err| return mapDeleteNodeError(err);
+            var first_key: ?u64 = null;
+            for (0..@as(usize, count) + 1) |child_index| {
+                const child_id = internal.childPageAt(child_index) catch |err| return mapDeleteNodeError(err);
+                const child_minimum = try refreshSeparators(tree, child_id, depth + 1);
+                if (child_index == 0) {
+                    first_key = child_minimum;
+                } else {
+                    var cell = internal.readCell(child_index - 1) catch |err| return mapDeleteNodeError(err);
+                    cell.separator_key = child_minimum;
+                    internal.writeCell(child_index - 1, cell) catch |err| return mapDeleteNodeError(err);
+                }
+            }
+            return first_key orelse error.CorruptNode;
+        },
+    }
+}
+
+fn nodeParentPageId(current: node.Node) u32 {
+    return switch (current) {
+        .leaf => |leaf| leaf.parentPageId(),
+        .internal => |internal| internal.parentPageId(),
+    };
+}
+
+fn nodeCellCount(current: node.Node) RebalanceError!usize {
+    return current.cellCount() catch |err| return mapNodeErrorToRebalance(err);
+}
+
+fn nodeMinCellCount(current: node.Node) usize {
+    return switch (current) {
+        .leaf => node.leaf_layout.max_cells / 2,
+        .internal => node.internal_layout.max_cells / 2,
+    };
+}
+
+fn rebalanceAt(tree: *BPlusTree, page_id: u32, depth: usize) RebalanceError!void {
+    if (depth >= 128) return error.CorruptNode;
+    const root_page_id = tree.root_page_id orelse return error.CorruptNode;
+    const page = tree.pager.getPage(page_id) catch return error.Storage;
+    const current = node.Node.open(page) catch |err| return mapNodeErrorToRebalance(err);
+    const current_count = try nodeCellCount(current);
+
+    if (page_id == root_page_id) {
+        if (current == .internal and current_count == 0) {
+            const child_page_id = current.internal.firstChildPageId();
+            if (child_page_id == page_id) return error.CorruptNode;
+            const child_page = tree.pager.getPage(child_page_id) catch return error.Storage;
+            var child = node.Node.open(child_page) catch |err| return mapNodeErrorToRebalance(err);
+            child.setParentPageId(0);
+            tree.root_page_id = child_page_id;
+            node.invalidatePage(page);
+        }
+        return;
+    }
+
+    const minimum = nodeMinCellCount(current);
+    if (current_count >= minimum) return;
+
+    const parent_page_id = nodeParentPageId(current);
+    const parent_page = tree.pager.getPage(parent_page_id) catch return error.Storage;
+    const parent_node = node.Node.open(parent_page) catch |err| return mapNodeErrorToRebalance(err);
+    const parent = switch (parent_node) {
+        .internal => |internal| internal,
+        .leaf => return error.InvalidNodeType,
+    };
+    const left_sibling = tree.siblingPageId(page_id, .previous) catch |err| return mapSearchErrorToRebalance(err);
+    const right_sibling = tree.siblingPageId(page_id, .next) catch |err| return mapSearchErrorToRebalance(err);
+
+    if (left_sibling == null and right_sibling == null) {
+        const parent_count = try nodeCellCount(.{ .internal = parent });
+        if (parent_page_id == root_page_id and parent_count == 0) {
+            try rebalanceAt(tree, parent_page_id, depth + 1);
+            if (tree.root_page_id.? == page_id) return;
+            return rebalanceAt(tree, page_id, depth + 1);
+        }
+        if (parent_page_id != root_page_id and parent_count < node.internal_layout.max_cells / 2) {
+            try rebalanceAt(tree, parent_page_id, depth + 1);
+            if (tree.root_page_id.? == page_id) return;
+            return rebalanceAt(tree, page_id, depth + 1);
+        }
+        return error.CorruptNode;
+    }
+
+    if (left_sibling) |sibling_id| {
+        tree.redistributeSiblings(sibling_id, page_id) catch |err| {
+            if (err != error.NoSpace) return mapRedistributeErrorToRebalance(err);
+        };
+        const left_page = tree.pager.getPage(sibling_id) catch return error.Storage;
+        const left_node = node.Node.open(left_page) catch |err| return mapNodeErrorToRebalance(err);
+        const current_page = tree.pager.getPage(page_id) catch return error.Storage;
+        const current_node = node.Node.open(current_page) catch |err| return mapNodeErrorToRebalance(err);
+        if (try nodeCellCount(left_node) >= nodeMinCellCount(left_node) and
+            try nodeCellCount(current_node) >= nodeMinCellCount(current_node)) return;
+    }
+    if (right_sibling) |sibling_id| {
+        tree.redistributeSiblings(page_id, sibling_id) catch |err| {
+            if (err != error.NoSpace) return mapRedistributeErrorToRebalance(err);
+        };
+        const current_page = tree.pager.getPage(page_id) catch return error.Storage;
+        const current_node = node.Node.open(current_page) catch |err| return mapNodeErrorToRebalance(err);
+        const right_page = tree.pager.getPage(sibling_id) catch return error.Storage;
+        const right_node = node.Node.open(right_page) catch |err| return mapNodeErrorToRebalance(err);
+        if (try nodeCellCount(current_node) >= nodeMinCellCount(current_node) and
+            try nodeCellCount(right_node) >= nodeMinCellCount(right_node)) return;
+    }
+
+    if (left_sibling) |sibling_id| {
+        if (tree.mergeSiblings(sibling_id, page_id)) |_| {
+            try rebalanceAt(tree, sibling_id, depth + 1);
+            const merged_page = tree.pager.getPage(sibling_id) catch return error.Storage;
+            const merged_node = node.Node.open(merged_page) catch |err| return mapNodeErrorToRebalance(err);
+            const merged_parent_id = nodeParentPageId(merged_node);
+            if (sibling_id != tree.root_page_id.? and merged_parent_id != tree.root_page_id.?) {
+                try rebalanceAt(tree, merged_parent_id, depth + 1);
+            }
+            return;
+        } else |err| {
+            if (err != error.NoSpace) return mapMergeErrorToRebalance(err);
+        }
+    }
+    if (right_sibling) |sibling_id| {
+        if (tree.mergeSiblings(page_id, sibling_id)) |_| {
+            try rebalanceAt(tree, page_id, depth + 1);
+            const merged_page = tree.pager.getPage(page_id) catch return error.Storage;
+            const merged_node = node.Node.open(merged_page) catch |err| return mapNodeErrorToRebalance(err);
+            const merged_parent_id = nodeParentPageId(merged_node);
+            if (page_id != tree.root_page_id.? and merged_parent_id != tree.root_page_id.?) {
+                try rebalanceAt(tree, merged_parent_id, depth + 1);
+            }
+            return;
+        } else |err| {
+            if (err != error.NoSpace) return mapMergeErrorToRebalance(err);
+        }
+    }
+
+    return error.NoSpace;
+}
+
+fn mapSearchErrorToRebalance(err: SearchError) RebalanceError {
+    return switch (err) {
+        error.CorruptNode => error.CorruptNode,
+        error.InvalidNodeType => error.InvalidNodeType,
+        error.Storage => error.Storage,
+    };
+}
+
+fn mergeLeafPages(
+    left: node.LeafNode,
+    right: node.LeafNode,
+    parent_page_id: u32,
+) MergeError!void {
+    const left_count = left.cellCount() catch |err| return mapMergeNodeError(err);
+    const right_count = right.cellCount() catch |err| return mapMergeNodeError(err);
+    const total_count = @as(usize, left_count) + right_count;
+    if (total_count > node.leaf_layout.max_cells) return error.NoSpace;
+
+    var records: [node.leaf_layout.max_cells]node.LeafRecord = undefined;
+    var values: [pager.page_size * 2]u8 = undefined;
+    var record_count: usize = 0;
+    var values_len: usize = 0;
+    try appendLeafRecords(left, &records, &record_count, &values, &values_len);
+    try appendLeafRecords(right, &records, &record_count, &values, &values_len);
+    if (!node.recordsFit(records[0..record_count])) return error.NoSpace;
+
+    node.rebuildLeafPage(
+        left.page,
+        records[0..record_count],
+        values[0..values_len],
+        parent_page_id,
+        right.nextLeafPageId(),
+    ) catch |err| return mapMergeNodeError(err);
+    node.invalidatePage(right.page);
+}
+
+fn appendLeafRecords(
+    leaf: node.LeafNode,
+    records: []node.LeafRecord,
+    record_count: *usize,
+    values: []u8,
+    values_len: *usize,
+) MergeError!void {
+    const count = leaf.cellCount() catch |err| return mapMergeNodeError(err);
+    if (count > records.len - record_count.*) return error.NoSpace;
+    for (0..count) |index| {
+        const cell = leaf.readCell(index) catch |err| return mapMergeNodeError(err);
+        const value = leaf.readValue(index) catch |err| return mapMergeNodeError(err);
+        if (value.len > values.len - values_len.*) return error.NoSpace;
+        @memcpy(values[values_len.* .. values_len.* + value.len], value);
+        records[record_count.*] = .{
+            .key = cell.key,
+            .value_offset = values_len.*,
+            .value_length = value.len,
+        };
+        values_len.* += value.len;
+        record_count.* += 1;
+    }
+}
+
+fn mergeInternalPages(
+    tree: *BPlusTree,
+    left: node.InternalNode,
+    right: node.InternalNode,
+    parent_separator: u64,
+    parent_page_id: u32,
+) MergeError!void {
+    const left_count = left.cellCount() catch |err| return mapMergeNodeError(err);
+    const right_count = right.cellCount() catch |err| return mapMergeNodeError(err);
+    const total_count = @as(usize, left_count) + 1 + right_count;
+    if (total_count > node.internal_layout.max_cells) return error.NoSpace;
+
+    var separators: [node.internal_layout.max_cells]u64 = undefined;
+    var children: [node.internal_layout.max_cells + 1]u32 = undefined;
+    var separator_count: usize = 0;
+    var child_count: usize = 1;
+    children[0] = left.firstChildPageId();
+
+    for (0..left_count) |index| {
+        const cell = left.readCell(index) catch |err| return mapMergeNodeError(err);
+        separators[separator_count] = cell.separator_key;
+        children[child_count] = cell.child_page_id;
+        separator_count += 1;
+        child_count += 1;
+    }
+    separators[separator_count] = parent_separator;
+    children[child_count] = right.firstChildPageId();
+    separator_count += 1;
+    child_count += 1;
+    for (0..right_count) |index| {
+        const cell = right.readCell(index) catch |err| return mapMergeNodeError(err);
+        separators[separator_count] = cell.separator_key;
+        children[child_count] = cell.child_page_id;
+        separator_count += 1;
+        child_count += 1;
+    }
+
+    node.rebuildInternalPage(
+        left.page,
+        parent_page_id,
+        children[0],
+        separators[0..separator_count],
+        children[0..child_count],
+    ) catch |err| return mapMergeNodeError(err);
+    for (children[0..child_count]) |child_page_id| {
+        const child_page = tree.pager.getPage(child_page_id) catch return error.Storage;
+        var child_node = node.Node.open(child_page) catch |err| return mapMergeNodeError(err);
+        child_node.setParentPageId(left.page.id);
+    }
+    node.invalidatePage(right.page);
+}
+
+fn redistributeLeafPages(
+    left: node.LeafNode,
+    right: node.LeafNode,
+    parent: node.InternalNode,
+    parent_cell_index: usize,
+) RedistributeError!void {
+    const left_count = left.cellCount() catch |err| return mapRedistributeNodeError(err);
+    const right_count = right.cellCount() catch |err| return mapRedistributeNodeError(err);
+    const total_count = @as(usize, left_count) + right_count;
+    if (total_count < 2) return;
+
+    var records: [node.leaf_layout.max_cells * 2]node.LeafRecord = undefined;
+    var values: [pager.page_size * 2]u8 = undefined;
+    var record_count: usize = 0;
+    var values_len: usize = 0;
+    appendLeafRecords(left, &records, &record_count, &values, &values_len) catch |err| return mapMergeErrorToRedistribute(err);
+    appendLeafRecords(right, &records, &record_count, &values, &values_len) catch |err| return mapMergeErrorToRedistribute(err);
+    if (record_count < 2) return;
+
+    const target = record_count / 2;
+    var split_index: ?usize = null;
+    var best_distance: usize = record_count;
+    for (1..record_count) |candidate| {
+        if (!node.recordsFit(records[0..candidate]) or !node.recordsFit(records[candidate..record_count])) continue;
+        const distance = if (candidate > target) candidate - target else target - candidate;
+        if (distance < best_distance) {
+            split_index = candidate;
+            best_distance = distance;
+        }
+    }
+    const split = split_index orelse return error.NoSpace;
+    const separator = records[split].key;
+    const parent_cell = parent.readCell(parent_cell_index) catch |err| return mapRedistributeNodeError(err);
+    const right_next_page_id = right.nextLeafPageId();
+
+    node.rebuildLeafPage(
+        left.page,
+        records[0..split],
+        values[0..values_len],
+        parent.page.id,
+        right.page.id,
+    ) catch |err| return mapRedistributeNodeError(err);
+    node.rebuildLeafPage(
+        right.page,
+        records[split..record_count],
+        values[0..values_len],
+        parent.page.id,
+        right_next_page_id,
+    ) catch |err| return mapRedistributeNodeError(err);
+    var updated_parent = parent;
+    updated_parent.writeCell(parent_cell_index, .{
+        .separator_key = separator,
+        .child_page_id = parent_cell.child_page_id,
+    }) catch |err| return mapRedistributeNodeError(err);
+}
+
+fn redistributeInternalPages(
+    tree: *BPlusTree,
+    left: node.InternalNode,
+    right: node.InternalNode,
+    parent: node.InternalNode,
+    parent_cell_index: usize,
+) RedistributeError!void {
+    const left_count = left.cellCount() catch |err| return mapRedistributeNodeError(err);
+    const right_count = right.cellCount() catch |err| return mapRedistributeNodeError(err);
+    const total_count = @as(usize, left_count) + 1 + right_count;
+    if (total_count < 2) return;
+
+    var separators: [node.internal_layout.max_cells * 2 + 1]u64 = undefined;
+    var children: [node.internal_layout.max_cells * 2 + 2]u32 = undefined;
+    var separator_count: usize = 0;
+    var child_count: usize = 1;
+    children[0] = left.firstChildPageId();
+    for (0..left_count) |index| {
+        const cell = left.readCell(index) catch |err| return mapRedistributeNodeError(err);
+        separators[separator_count] = cell.separator_key;
+        children[child_count] = cell.child_page_id;
+        separator_count += 1;
+        child_count += 1;
+    }
+    const parent_cell = parent.readCell(parent_cell_index) catch |err| return mapRedistributeNodeError(err);
+    separators[separator_count] = parent_cell.separator_key;
+    children[child_count] = right.firstChildPageId();
+    separator_count += 1;
+    child_count += 1;
+    for (0..right_count) |index| {
+        const cell = right.readCell(index) catch |err| return mapRedistributeNodeError(err);
+        separators[separator_count] = cell.separator_key;
+        children[child_count] = cell.child_page_id;
+        separator_count += 1;
+        child_count += 1;
+    }
+
+    const split_index = separator_count / 2;
+    const promoted_separator = separators[split_index];
+    node.rebuildInternalPage(
+        left.page,
+        parent.page.id,
+        children[0],
+        separators[0..split_index],
+        children[0 .. split_index + 1],
+    ) catch |err| return mapRedistributeNodeError(err);
+    node.rebuildInternalPage(
+        right.page,
+        parent.page.id,
+        children[split_index + 1],
+        separators[split_index + 1 .. separator_count],
+        children[split_index + 1 .. child_count],
+    ) catch |err| return mapRedistributeNodeError(err);
+
+    for (children[0 .. split_index + 1]) |child_page_id| {
+        const child_page = tree.pager.getPage(child_page_id) catch return error.Storage;
+        var child_node = node.Node.open(child_page) catch |err| return mapRedistributeNodeError(err);
+        child_node.setParentPageId(left.page.id);
+    }
+    for (children[split_index + 1 .. child_count]) |child_page_id| {
+        const child_page = tree.pager.getPage(child_page_id) catch return error.Storage;
+        var child_node = node.Node.open(child_page) catch |err| return mapRedistributeNodeError(err);
+        child_node.setParentPageId(right.page.id);
+    }
+
+    var updated_parent = parent;
+    updated_parent.writeCell(parent_cell_index, .{
+        .separator_key = promoted_separator,
+        .child_page_id = right.page.id,
+    }) catch |err| return mapRedistributeNodeError(err);
+}
 
 /// 尝试直接插入；空间不足时改为分裂叶子。
 fn insertOrSplitLeaf(

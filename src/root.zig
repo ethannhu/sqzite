@@ -23,5 +23,10 @@ test "basic add functionality" {
 test {
     _ = @import("storage/pager_test.zig");
     _ = @import("storage/btree_test.zig");
+    _ = @import("storage/btree_neighbor_test.zig");
+    _ = @import("storage/btree_merge_test.zig");
+    _ = @import("storage/btree_redistribute_test.zig");
+    _ = @import("storage/btree_rebalance_test.zig");
+    _ = @import("storage/btree_delete_test.zig");
     _ = @import("storage/node_test.zig");
 }

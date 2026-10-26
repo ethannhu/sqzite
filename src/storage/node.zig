@@ -235,6 +235,13 @@ pub const InternalNode = struct {
         return null;
     }
 
+    pub fn childPageAt(self: *const InternalNode, index: usize) NodeError!u32 {
+        const count = try self.cellCount();
+        if (index > count) return error.CellOutOfBounds;
+        if (index == 0) return self.firstChildPageId();
+        return (try self.readCell(index - 1)).child_page_id;
+    }
+
     pub fn insertCell(self: *InternalNode, index: usize, cell: InternalCell) NodeError!void {
         const count = try self.cellCount();
         if (count == internal_layout.max_cells) return error.NoSpace;
@@ -250,6 +257,24 @@ pub const InternalNode = struct {
         try self.writeCell(index, cell);
         writeU16(&self.page.data, header_layout.cell_count_offset, count + 1);
         self.page.dirty = true;
+    }
+
+    /// 删除槽位并左移其后的分隔键。
+    pub fn deleteCell(self: *InternalNode, index: usize) NodeError!InternalCell {
+        const count = try self.cellCount();
+        if (index >= count) return error.CellOutOfBounds;
+        const removed = try self.readCell(index);
+        var cursor = index;
+        while (cursor + 1 < count) : (cursor += 1) {
+            const source = internal_layout.header_size + (cursor + 1) * internal_layout.cell_size;
+            const destination = internal_layout.header_size + cursor * internal_layout.cell_size;
+            @memcpy(self.page.data[destination .. destination + internal_layout.cell_size], self.page.data[source .. source + internal_layout.cell_size]);
+        }
+        const last = internal_layout.header_size + (count - 1) * internal_layout.cell_size;
+        @memset(self.page.data[last .. last + internal_layout.cell_size], 0);
+        writeU16(&self.page.data, header_layout.cell_count_offset, count - 1);
+        self.page.dirty = true;
+        return removed;
     }
 
     pub fn firstChildPageId(self: *const InternalNode) u32 {
@@ -322,6 +347,12 @@ pub const Node = union(enum) {
         };
     }
 };
+
+/// 清除已被合并移除的节点页，避免旧页号继续被当作有效节点使用。
+pub fn invalidatePage(page: *pager.Page) void {
+    @memset(&page.data, 0);
+    page.dirty = true;
+}
 
 fn findChildPageForKey(data: []const u8, key: u64, count: u16) u32 {
     var low: usize = 0;
