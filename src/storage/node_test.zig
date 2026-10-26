@@ -19,9 +19,9 @@ test "初始化叶子节点会清空页面并写入头部" {
     const leaf = node.LeafNode.init(&page, 2, 7);
 
     try std.testing.expectEqual(@as(u8, @intFromEnum(node.NodeType.leaf)), page.data[node.header_layout.node_type_offset]);
-    try std.testing.expectEqual(@as(u16, 0), readU16(&page.data, node.header_layout.cell_count_offset));
-    try std.testing.expectEqual(@as(u32, 2), readU32(&page.data, node.header_layout.parent_page_id_offset));
-    try std.testing.expectEqual(@as(u32, 7), readU32(&page.data, node.leaf_layout.next_leaf_page_id_offset));
+    try std.testing.expectEqual(@as(u16, 0), node.readU16(&page.data, node.header_layout.cell_count_offset));
+    try std.testing.expectEqual(@as(u32, 2), node.readU32(&page.data, node.header_layout.parent_page_id_offset));
+    try std.testing.expectEqual(@as(u32, 7), node.readU32(&page.data, node.leaf_layout.next_leaf_page_id_offset));
     try std.testing.expect(page.dirty);
     try std.testing.expectEqual(page.id, leaf.page.id);
     for (page.data[node.leaf_layout.header_size..]) |byte| {
@@ -41,7 +41,7 @@ test "叶子节点可以写入并读取槽位" {
     page.dirty = false;
     try leaf.writeCell(0, cell);
     try std.testing.expectEqual(cell, try leaf.readCell(0));
-    try std.testing.expectEqual(@as(u16, 1), readU16(&page.data, node.header_layout.cell_count_offset));
+    try std.testing.expectEqual(@as(u16, 1), node.readU16(&page.data, node.header_layout.cell_count_offset));
     try std.testing.expect(page.dirty);
 }
 
@@ -58,7 +58,7 @@ test "叶子节点拒绝跳过槽位写入" {
     const cell = node.LeafCell{ .key = 1, .value_offset = 100, .value_length = 1 };
 
     try std.testing.expectError(error.CellOutOfBounds, leaf.writeCell(1, cell));
-    try std.testing.expectEqual(@as(u16, 0), readU16(&page.data, node.header_layout.cell_count_offset));
+    try std.testing.expectEqual(@as(u16, 0), node.readU16(&page.data, node.header_layout.cell_count_offset));
 }
 
 test "初始化内部节点会写入头部和第一个子页" {
@@ -68,9 +68,9 @@ test "初始化内部节点会写入头部和第一个子页" {
     const internal = node.InternalNode.init(&page, 3, 9);
 
     try std.testing.expectEqual(@as(u8, @intFromEnum(node.NodeType.internal)), page.data[node.header_layout.node_type_offset]);
-    try std.testing.expectEqual(@as(u16, 0), readU16(&page.data, node.header_layout.cell_count_offset));
-    try std.testing.expectEqual(@as(u32, 3), readU32(&page.data, node.header_layout.parent_page_id_offset));
-    try std.testing.expectEqual(@as(u32, 9), readU32(&page.data, node.internal_layout.first_child_page_id_offset));
+    try std.testing.expectEqual(@as(u16, 0), node.readU16(&page.data, node.header_layout.cell_count_offset));
+    try std.testing.expectEqual(@as(u32, 3), node.readU32(&page.data, node.header_layout.parent_page_id_offset));
+    try std.testing.expectEqual(@as(u32, 9), node.readU32(&page.data, node.internal_layout.first_child_page_id_offset));
     try std.testing.expect(page.dirty);
     try std.testing.expectEqual(page.id, internal.page.id);
     for (page.data[node.internal_layout.header_size..]) |byte| {
@@ -89,7 +89,7 @@ test "内部节点可以写入并读取分隔键和子页" {
     page.dirty = false;
     try internal.writeCell(0, cell);
     try std.testing.expectEqual(cell, try internal.readCell(0));
-    try std.testing.expectEqual(@as(u16, 1), readU16(&page.data, node.header_layout.cell_count_offset));
+    try std.testing.expectEqual(@as(u16, 1), node.readU16(&page.data, node.header_layout.cell_count_offset));
     try std.testing.expect(page.dirty);
 }
 
@@ -106,7 +106,7 @@ test "内部节点拒绝跳过槽位写入" {
     const cell = node.InternalCell{ .separator_key = 1, .child_page_id = 17 };
 
     try std.testing.expectError(error.CellOutOfBounds, internal.writeCell(1, cell));
-    try std.testing.expectEqual(@as(u16, 0), readU16(&page.data, node.header_layout.cell_count_offset));
+    try std.testing.expectEqual(@as(u16, 0), node.readU16(&page.data, node.header_layout.cell_count_offset));
 }
 
 fn testPage(id: u32) pager.Page {
@@ -115,15 +115,4 @@ fn testPage(id: u32) pager.Page {
         .dirty = false,
         .data = [_]u8{0} ** pager.page_size,
     };
-}
-
-fn readU16(data: []const u8, offset: usize) u16 {
-    return @as(u16, data[offset]) | (@as(u16, data[offset + 1]) << 8);
-}
-
-fn readU32(data: []const u8, offset: usize) u32 {
-    return @as(u32, data[offset]) |
-        (@as(u32, data[offset + 1]) << 8) |
-        (@as(u32, data[offset + 2]) << 16) |
-        (@as(u32, data[offset + 3]) << 24);
 }

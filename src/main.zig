@@ -4,48 +4,46 @@ const Io = std.Io;
 const zig_hello = @import("zig_hello");
 
 pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
+    // 输出调试信息，忽略写入错误。
     std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
 
-    // This is appropriate for anything that lives as long as the process.
+    // arena 生命周期与进程一致。
     const arena: std.mem.Allocator = init.arena.allocator();
 
-    // Accessing command line arguments:
+    // 读取命令行参数。
     const args = try init.minimal.args.toSlice(arena);
     for (args) |arg| {
         std.log.info("arg: {s}", .{arg});
     }
 
-    // In order to do I/O operations need an `Io` instance.
+    // 获取执行 I/O 所需的实例。
     const io = init.io;
 
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
+    // stdout 用于程序输出，调试信息应写入 stderr。
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout_writer = &stdout_file_writer.interface;
 
     try zig_hello.printAnotherMessage(stdout_writer);
 
-    try stdout_writer.flush(); // Don't forget to flush!
+    try stdout_writer.flush(); // 刷新缓冲区。
 }
 
-test "simple test" {
+test "列表可以追加并弹出元素" {
     const gpa = std.testing.allocator;
     var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
+    defer list.deinit(gpa); // 释放列表占用的内存。
     try list.append(gpa, 42);
     try std.testing.expectEqual(@as(i32, 42), list.pop());
 }
 
-test "fuzz example" {
+test "模糊测试验证列表复制数据" {
     try std.testing.fuzz({}, testOne, .{});
 }
 
 fn testOne(context: void, smith: *std.testing.Smith) !void {
     _ = context;
-    // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
+    // 使用 `zig build test --fuzz` 生成更多输入。
 
     const gpa = std.testing.allocator;
     var list: std.ArrayList(u8) = .empty;

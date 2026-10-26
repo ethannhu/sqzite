@@ -4,7 +4,7 @@ const pager = @import("pager.zig");
 
 const page_size = pager.page_size;
 
-test "a newly allocated page has an id and starts clean" {
+test "新分配的页面具有页号且初始未修改" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var db = try pager.Pager.open(std.testing.allocator, std.testing.io, tmp.dir, "db");
@@ -16,7 +16,7 @@ test "a newly allocated page has an id and starts clean" {
     try std.testing.expectEqual(page_size, page.data.len);
 }
 
-test "dirty page data is persisted and reloaded as raw page bytes" {
+test "脏页数据按原始字节写入并重新读取" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const expected = [_]u8{0x5a} ** page_size;
@@ -42,7 +42,7 @@ test "dirty page data is persisted and reloaded as raw page bytes" {
     }
 }
 
-test "flushing one page leaves neighboring page bytes intact" {
+test "刷新页面不会影响相邻页面数据" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const first = [_]u8{0x11} ** page_size;

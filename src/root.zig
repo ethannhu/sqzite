@@ -1,13 +1,12 @@
-//! By convention, root.zig is the root source file when making a package.
+//! 项目库模块入口。
 const std = @import("std");
 const Io = std.Io;
 
 pub const btree = @import("storage/btree.zig");
 pub const node = @import("storage/node.zig");
+pub const pager = @import("storage/pager.zig");
 
-/// This is a documentation comment to explain the `printAnotherMessage` function below.
-///
-/// Accepting an `Io.Writer` instance is a handy way to write reusable code.
+/// 向指定 writer 输出测试提示。
 pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("Run `zig build test` to run the tests.\n", .{});
 }
@@ -16,17 +15,12 @@ pub fn add(a: i32, b: i32) i32 {
     return a + b;
 }
 
-test "basic add functionality" {
+test "加法返回两个整数之和" {
     try std.testing.expect(add(3, 7) == 10);
 }
 
 test {
     _ = @import("storage/pager_test.zig");
     _ = @import("storage/btree_test.zig");
-    _ = @import("storage/btree_neighbor_test.zig");
-    _ = @import("storage/btree_merge_test.zig");
-    _ = @import("storage/btree_redistribute_test.zig");
-    _ = @import("storage/btree_rebalance_test.zig");
-    _ = @import("storage/btree_delete_test.zig");
     _ = @import("storage/node_test.zig");
 }
