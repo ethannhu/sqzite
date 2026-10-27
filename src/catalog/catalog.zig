@@ -57,6 +57,21 @@ pub const Catalog = struct {
         };
     }
 
+    /// 更新 B+ Tree 根页并持久化目录。
+    pub fn updateRootPage(self: *Catalog, name: []const u8, root_page: u32) !void {
+        for (self.tables.items) |*table| {
+            if (!std.mem.eql(u8, table.name, name)) continue;
+            const previous = table.root_page;
+            table.root_page = root_page;
+            self.persist() catch |err| {
+                table.root_page = previous;
+                return err;
+            };
+            return;
+        }
+        return error.TableNotFound;
+    }
+
     fn load(self: *Catalog) !void {
         const data = &self.page.data;
         var cursor: usize = magic.len;
