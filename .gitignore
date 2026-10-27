@@ -24,3 +24,7 @@ zig-out/
 *.swp
 *.swo
 .zed
+
+# Benchmark artifacts
+bench/3rdparty
+bench/results
