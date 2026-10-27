@@ -14,6 +14,7 @@ pub const binder = @import("sql/binder.zig");
 pub const planner = @import("sql/planner.zig");
 pub const catalog = @import("catalog/catalog.zig");
 pub const executor = @import("execution/executor.zig");
+pub const shell = @import("shell/repl.zig");
 
 /// 向指定 writer 输出测试提示。
 pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {

@@ -1,69 +1,24 @@
 const std = @import("std");
 const Io = std.Io;
-
 const zig_hello = @import("zig_hello");
 
+/// 启动交互 Shell；可用第一个参数指定数据库文件。
 pub fn main(init: std.process.Init) !void {
-    // 输出调试信息，忽略写入错误。
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+    const allocator = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(allocator);
+    const path = if (args.len > 1) args[1] else "sqzite.db";
 
-    // arena 生命周期与进程一致。
-    const arena: std.mem.Allocator = init.arena.allocator();
+    var pager = try zig_hello.pager.Pager.open(allocator, init.io, Io.Dir.cwd(), path);
+    defer pager.close() catch {};
+    var catalog = try zig_hello.catalog.Catalog.open(allocator, &pager);
+    defer catalog.deinit();
+    var executor = zig_hello.executor.Executor{ .pager = &pager, .catalog = &catalog };
+    var repl = zig_hello.shell.Repl{ .allocator = allocator, .catalog = &catalog, .executor = &executor };
 
-    // 读取命令行参数。
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
-    }
-
-    // 获取执行 I/O 所需的实例。
-    const io = init.io;
-
-    // stdout 用于程序输出，调试信息应写入 stderr。
+    var stdin_buffer: [4096]u8 = undefined;
+    var stdin_reader: Io.File.Reader = .init(.stdin(), init.io, &stdin_buffer);
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
-
-    try zig_hello.printAnotherMessage(stdout_writer);
-
-    try stdout_writer.flush(); // 刷新缓冲区。
-}
-
-test "列表可以追加并弹出元素" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // 释放列表占用的内存。
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
-
-test "模糊测试验证列表复制数据" {
-    try std.testing.fuzz({}, testOne, .{});
-}
-
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // 使用 `zig build test --fuzz` 生成更多输入。
-
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
-    };
+    var stdout_file_writer: Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
+    try repl.run(&stdin_reader.interface, &stdout_file_writer.interface);
+    try stdout_file_writer.interface.flush();
 }
