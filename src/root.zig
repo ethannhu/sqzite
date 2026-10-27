@@ -13,6 +13,7 @@ pub const parser = @import("sql/parser.zig");
 pub const binder = @import("sql/binder.zig");
 pub const planner = @import("sql/planner.zig");
 pub const catalog = @import("catalog/catalog.zig");
+pub const executor = @import("execution/executor.zig");
 
 /// 向指定 writer 输出测试提示。
 pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
@@ -34,4 +35,5 @@ test {
     _ = @import("storage/table_test.zig");
     _ = @import("sql/lexer_test.zig");
     _ = @import("sql/parser_test.zig");
+    _ = @import("execution/executor_test.zig");
 }

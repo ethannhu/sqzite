@@ -1,23 +1,34 @@
+const std = @import("std");
 const ast = @import("ast.zig");
 const catalog = @import("../catalog/catalog.zig");
 
-/// 已解析的列引用。
-pub const BoundColumn = struct {
-    table: *const catalog.TableSchema,
-    index: usize,
+pub const BoundCreateTable = struct {
+    definition: ast.CreateTable,
 };
 
-/// Binder 接口：验证名称并将列引用解析为列索引。
+pub const BoundStatement = union(enum) {
+    create_table: BoundCreateTable,
+};
+
+/// 目前只绑定 CREATE TABLE。
 pub const Binder = struct {
-    catalog: *catalog.Catalog,
+    catalog: *const catalog.Catalog,
 
-    pub fn bind(self: *Binder, statement: ast.Statement) anyerror!BoundStatement {
-        _ = self;
-        _ = statement;
-        unreachable;
+    pub fn bind(self: *const Binder, statement: ast.Statement) !BoundStatement {
+        return switch (statement) {
+            .create_table => |create| .{ .create_table = .{ .definition = try self.bindCreateTable(create) } },
+            else => error.UnsupportedStatement,
+        };
     }
-};
 
-pub const BoundStatement = struct {
-    statement: ast.Statement,
+    fn bindCreateTable(self: *const Binder, create: ast.CreateTable) !ast.CreateTable {
+        if (create.columns.len == 0) return error.EmptyTableSchema;
+        if (self.catalog.findTable(create.name) != null) return error.TableAlreadyExists;
+        for (create.columns, 0..) |column, i| {
+            for (create.columns[0..i]) |previous| {
+                if (std.mem.eql(u8, previous.name, column.name)) return error.DuplicateColumn;
+            }
+        }
+        return create;
+    }
 };
